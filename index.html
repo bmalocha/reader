@@ -237,6 +237,7 @@
         }
 
         .chapter-content {
+            position: relative;
             background: var(--color-surface);
             border: 1px solid var(--color-border);
             border-radius: var(--radius-lg);
@@ -262,6 +263,26 @@
             height: auto;
             border-radius: var(--radius-md);
             margin: var(--space-20) 0;
+        }
+
+        .bookmark-icon {
+            position: absolute;
+            right: var(--space-4);
+            width: 16px;
+            height: 16px;
+            padding: 0;
+            border: none;
+            background: none;
+            color: var(--color-primary);
+            cursor: pointer;
+            line-height: 0;
+        }
+
+        .bookmark-icon svg {
+            display: block;
+            width: 16px;
+            height: 16px;
+            fill: currentColor;
         }
 
         .chapter-meta {
@@ -450,6 +471,7 @@
                 this.chapters = [];
                 this.currentChapterIndex = 0;
                 this.fileHash = null;
+                this.bookmark = null;
             }
 
             // Generate a simple id for the file (hash of its start + size)
@@ -498,12 +520,41 @@
                 return books.sort((a, b) => b.lastOpened - a.lastOpened);
             }
 
+            // Change a stored book in one transaction, so concurrent saves don't overwrite each other's fields
+            async updateBook(id, change) {
+                const db = await this.openDb();
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction('books', 'readwrite');
+                    const store = tx.objectStore('books');
+                    const req = store.get(id);
+                    req.onsuccess = () => {
+                        if (req.result) store.put(change(req.result));
+                    };
+                    tx.oncomplete = () => resolve();
+                    tx.onerror = () => reject(tx.error);
+                    tx.onabort = () => reject(tx.error);
+                });
+            }
+
             async saveProgress() {
-                const book = await this.getBook(this.fileHash);
-                if (!book) return;
-                book.chapterIndex = this.currentChapterIndex;
-                book.lastOpened = Date.now();
-                await this.putBook(book);
+                await this.updateBook(this.fileHash, book => {
+                    book.chapterIndex = this.currentChapterIndex;
+                    book.lastOpened = Date.now();
+                    return book;
+                });
+            }
+
+            // Store the bookmark on the current book, or clear it with null
+            async saveBookmark(bookmark) {
+                this.bookmark = bookmark;
+                try {
+                    await this.updateBook(this.fileHash, book => {
+                        book.bookmark = bookmark;
+                        return book;
+                    });
+                } catch (e) {
+                    console.warn('Could not save bookmark:', e);
+                }
             }
 
             // Load a new file and store it
@@ -515,6 +566,7 @@
                 } catch (e) {
                     console.warn('Could not read stored books:', e);
                 }
+                this.bookmark = (existing && existing.bookmark) || null;
                 await this.parseEPUB(await file.arrayBuffer(), id, existing ? existing.chapterIndex : 0, file.name);
                 try {
                     await this.putBook({
@@ -524,6 +576,7 @@
                         author: this.author,
                         blob: file,
                         chapterIndex: this.currentChapterIndex,
+                        bookmark: this.bookmark,
                         lastOpened: Date.now()
                     });
                 } catch (e) {
@@ -536,6 +589,7 @@
                 const book = await this.getBook(id);
                 if (!book) throw new Error('Book not found in storage');
                 await this.parseEPUB(await book.blob.arrayBuffer(), id, book.chapterIndex, book.name || book.title);
+                this.bookmark = book.bookmark || null;
                 book.lastOpened = Date.now();
                 await this.putBook(book);
             }
@@ -668,8 +722,7 @@
                 chapterInput.value = reader.currentChapterIndex + 1;
                 return;
             }
-            reader.currentChapterIndex = Math.max(0, Math.min(n, reader.chapters.length) - 1);
-            await displayChapter();
+            await goToChapter(Math.max(0, Math.min(n, reader.chapters.length) - 1));
         });
         const loadingIndicator = document.getElementById('loadingIndicator');
         const prevBtn = document.getElementById('prevBtn');
@@ -714,6 +767,7 @@
                 const chapter = await reader.loadChapter(reader.currentChapterIndex);
                 chapterContent.innerHTML = '';
                 chapterContent.appendChild(chapter.content);
+                restoreBookmark();
                 
                 updateNavigation();
                 loadingIndicator.style.display = 'none';
@@ -739,29 +793,25 @@
 
         prevBtn.addEventListener('click', async () => {
             if (reader.currentChapterIndex > 0) {
-                reader.currentChapterIndex--;
-                await displayChapter();
+                await goToChapter(reader.currentChapterIndex - 1);
             }
         });
 
         nextBtn.addEventListener('click', async () => {
             if (reader.currentChapterIndex < reader.chapters.length - 1) {
-                reader.currentChapterIndex++;
-                await displayChapter();
+                await goToChapter(reader.currentChapterIndex + 1);
             }
         });
 
         prevBtn2.addEventListener('click', async () => {
             if (reader.currentChapterIndex > 0) {
-                reader.currentChapterIndex--;
-                await displayChapter();
+                await goToChapter(reader.currentChapterIndex - 1);
             }
         });
 
         nextBtn2.addEventListener('click', async () => {
             if (reader.currentChapterIndex < reader.chapters.length - 1) {
-                reader.currentChapterIndex++;
-                await displayChapter();
+                await goToChapter(reader.currentChapterIndex + 1);
             }
         });
 
@@ -773,6 +823,125 @@
             reader.epub = null;
             reader.chapters = [];
         });
+
+        // Move to another chapter. That clears the bookmark, and the new chapter opens at the top
+        async function goToChapter(index) {
+            reader.currentChapterIndex = index;
+            if (reader.bookmark) {
+                await reader.saveBookmark(null);
+            }
+            await displayChapter();
+        }
+
+        // Bookmark: one per book, stored as the text position of the clicked line
+        // (child-index path from the chapter root, plus the character offset)
+        function pathFromRoot(node, root) {
+            const path = [];
+            for (let n = node; n !== root; n = n.parentNode) {
+                path.unshift(Array.prototype.indexOf.call(n.parentNode.childNodes, n));
+            }
+            return path;
+        }
+
+        function nodeFromPath(path, root) {
+            let node = root;
+            for (const i of path) {
+                node = node.childNodes[i];
+                if (!node) return null;
+            }
+            return node;
+        }
+
+        function caretAt(x, y) {
+            if (document.caretPositionFromPoint) {
+                const pos = document.caretPositionFromPoint(x, y);
+                return pos && { node: pos.offsetNode, offset: pos.offset };
+            }
+            if (document.caretRangeFromPoint) {
+                const range = document.caretRangeFromPoint(x, y);
+                return range && { node: range.startContainer, offset: range.startOffset };
+            }
+            return null;
+        }
+
+        // Viewport rect of the bookmarked line, or null when the bookmark is not in the open chapter
+        function bookmarkRect() {
+            const bm = reader.bookmark;
+            const root = chapterContent.firstElementChild;
+            if (!bm || !root || bm.chapterIndex !== reader.currentChapterIndex) return null;
+            const node = nodeFromPath(bm.path, root);
+            if (!node) return null;
+            const isText = node.nodeType === Node.TEXT_NODE;
+            const length = isText ? node.length : node.childNodes.length;
+            const offset = Math.min(bm.offset, length);
+            const range = document.createRange();
+            range.setStart(node, offset);
+            if (isText && offset < length) {
+                range.setEnd(node, offset + 1);
+            } else {
+                range.collapse(true);
+            }
+            return range.getBoundingClientRect();
+        }
+
+        // Draw the bookmark icon in the right margin, next to its line
+        function renderBookmark() {
+            chapterContent.querySelector('.bookmark-icon')?.remove();
+            const rect = bookmarkRect();
+            if (!rect) return;
+            const box = chapterContent.getBoundingClientRect();
+            const icon = document.createElement('button');
+            icon.className = 'bookmark-icon';
+            icon.title = 'Remove bookmark';
+            icon.setAttribute('aria-label', 'Remove bookmark');
+            icon.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h12v19l-6-4.5L6 21z"/></svg>';
+            icon.style.top = `${rect.top - box.top - chapterContent.clientTop + (rect.height - 16) / 2}px`;
+            chapterContent.appendChild(icon);
+        }
+
+        // Open the chapter at its bookmark, or at the top when there is none
+        function restoreBookmark() {
+            const rect = bookmarkRect();
+            if (rect) {
+                window.scrollTo(0, window.scrollY + rect.top - window.innerHeight / 3);
+            } else {
+                window.scrollTo(0, 0);
+            }
+            renderBookmark();
+        }
+
+        async function setBookmark(bookmark) {
+            await reader.saveBookmark(bookmark);
+            renderBookmark();
+        }
+
+        // Clicking the right margin bookmarks the clicked line; clicking the icon removes the bookmark
+        document.addEventListener('click', e => {
+            if (!readerSection.classList.contains('active') || !reader.chapters.length) return;
+            if (e.target.closest('.bookmark-icon')) {
+                setBookmark(null);
+                return;
+            }
+
+            const box = chapterContent.getBoundingClientRect();
+            const style = getComputedStyle(chapterContent);
+            const border = chapterContent.clientLeft;
+            const textLeft = box.left + border + parseFloat(style.paddingLeft);
+            const textRight = box.right - border - parseFloat(style.paddingRight);
+            const inChapter = e.clientY >= box.top && e.clientY <= box.bottom;
+            if (!inChapter || e.clientX < textRight) return;
+
+            const root = chapterContent.firstElementChild;
+            const caret = caretAt(textLeft + 1, e.clientY);
+            if (!root || !caret || !root.contains(caret.node)) return;
+            setBookmark({
+                chapterIndex: reader.currentChapterIndex,
+                path: pathFromRoot(caret.node, root),
+                offset: caret.offset
+            });
+        });
+
+        window.addEventListener('resize', renderBookmark);
 
         // Views: 'upload', 'reader' or 'library'
         const librarySection = document.getElementById('librarySection');
