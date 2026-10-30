@@ -338,6 +338,43 @@
         .book-info strong {
             font-weight: var(--font-weight-semibold);
         }
+
+        .library-section {
+            display: none;
+        }
+
+        .library-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: var(--space-16);
+            background: var(--color-surface);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-lg);
+            padding: var(--space-16);
+            margin-bottom: var(--space-12);
+        }
+
+        .library-item-title {
+            font-weight: var(--font-weight-semibold);
+            font-size: var(--font-size-lg);
+        }
+
+        .library-item-meta {
+            font-size: var(--font-size-sm);
+            color: var(--color-text-secondary);
+        }
+
+        .library-item-actions {
+            display: flex;
+            gap: var(--space-8);
+            flex-shrink: 0;
+        }
+
+        .library-link {
+            display: inline-block;
+            margin-bottom: var(--space-16);
+        }
     </style>
 </head>
 <body>
@@ -365,10 +402,19 @@
             </div>
             <div id="uploadStatus"></div>
             <div id="bookInfo"></div>
+            <a href="#library">📚 Library</a>
+        </div>
+
+        <!-- Library Section -->
+        <div class="library-section" id="librarySection">
+            <h2 style="margin-bottom: var(--space-16);">Library</h2>
+            <a href="#" class="library-link" id="libraryBackLink">← Back to reader</a>
+            <div id="libraryList"></div>
         </div>
 
         <!-- Reader Section -->
         <div class="reader-section" id="readerSection">
+            <a href="#library" class="library-link">📚 Library</a>
             <div class="navigation">
                 <button class="btn btn--secondary nav-button" id="prevBtn">← Previous</button>
                 <div class="nav-center" id="chapterNav">Chapter 1 of 1</div>
@@ -397,7 +443,7 @@
                 this.fileHash = null;
             }
 
-            // Generate a simple hash of the file for cookie management
+            // Generate a simple id for the file (hash of its start + size)
             async generateFileHash(file) {
                 const buffer = await file.slice(0, 10000).arrayBuffer();
                 const array = new Uint8Array(buffer);
@@ -406,40 +452,89 @@
                     hash = ((hash << 5) - hash) + array[i];
                     hash = hash & hash;
                 }
-                return Math.abs(hash).toString(36);
+                return Math.abs(hash).toString(36) + '-' + file.size;
             }
 
-            // Cookie management
-            setCookie(fileHash, chapterIndex) {
-                const cookieData = JSON.stringify({
-                    fileHash: fileHash,
-                    chapterIndex: chapterIndex,
-                    timestamp: new Date().getTime()
-                });
-                document.cookie = `epubReader_${fileHash}=${encodeURIComponent(cookieData)}; path=/; max-age=31536000`;
-            }
-
-            getCookie(fileHash) {
-                const name = `epubReader_${fileHash}=`;
-                const cookies = document.cookie.split(';');
-                for (let cookie of cookies) {
-                    cookie = cookie.trim();
-                    if (cookie.startsWith(name)) {
-                        try {
-                            return JSON.parse(decodeURIComponent(cookie.substring(name.length)));
-                        } catch (e) {
-                            return null;
-                        }
-                    }
+            // Persistent storage (IndexedDB)
+            openDb() {
+                if (!this.dbPromise) {
+                    this.dbPromise = new Promise((resolve, reject) => {
+                        const req = indexedDB.open('epubReader', 1);
+                        req.onupgradeneeded = () => req.result.createObjectStore('books', { keyPath: 'id' });
+                        req.onsuccess = () => resolve(req.result);
+                        req.onerror = () => reject(req.error);
+                    });
                 }
-                return null;
+                return this.dbPromise;
             }
 
-            // Parse EPUB file
+            async dbRequest(mode, fn) {
+                const db = await this.openDb();
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction('books', mode);
+                    const req = fn(tx.objectStore('books'));
+                    tx.oncomplete = () => resolve(req.result);
+                    tx.onerror = () => reject(tx.error);
+                    tx.onabort = () => reject(tx.error);
+                });
+            }
+
+            getBook(id) { return this.dbRequest('readonly', s => s.get(id)); }
+            putBook(book) { return this.dbRequest('readwrite', s => s.put(book)); }
+            deleteBook(id) { return this.dbRequest('readwrite', s => s.delete(id)); }
+
+            // Stored books, most recently opened first
+            async listBooks() {
+                const books = await this.dbRequest('readonly', s => s.getAll());
+                return books.sort((a, b) => b.lastOpened - a.lastOpened);
+            }
+
+            async saveProgress() {
+                const book = await this.getBook(this.fileHash);
+                if (!book) return;
+                book.chapterIndex = this.currentChapterIndex;
+                book.lastOpened = Date.now();
+                await this.putBook(book);
+            }
+
+            // Load a new file and store it
             async loadEPUB(file) {
+                const id = await this.generateFileHash(file);
+                let existing = null;
                 try {
-                    this.fileHash = await this.generateFileHash(file);
-                    const arrayBuffer = await file.arrayBuffer();
+                    existing = await this.getBook(id);
+                } catch (e) {
+                    console.warn('Could not read stored books:', e);
+                }
+                await this.parseEPUB(await file.arrayBuffer(), id, existing ? existing.chapterIndex : 0);
+                try {
+                    await this.putBook({
+                        id,
+                        name: file.name,
+                        title: this.title,
+                        author: this.author,
+                        blob: file,
+                        chapterIndex: this.currentChapterIndex,
+                        lastOpened: Date.now()
+                    });
+                } catch (e) {
+                    console.warn('Could not store EPUB:', e);
+                }
+            }
+
+            // Load a previously stored book
+            async openStored(id) {
+                const book = await this.getBook(id);
+                if (!book) throw new Error('Book not found in storage');
+                await this.parseEPUB(await book.blob.arrayBuffer(), id, book.chapterIndex);
+                book.lastOpened = Date.now();
+                await this.putBook(book);
+            }
+
+            // Parse EPUB data
+            async parseEPUB(arrayBuffer, id, savedChapterIndex) {
+                try {
+                    this.fileHash = id;
                     const zip = new JSZip();
                     await zip.loadAsync(arrayBuffer);
 
@@ -483,13 +578,8 @@
                     this.title = title;
                     this.author = author;
 
-                    // Restore reading position from cookie
-                    const savedPosition = this.getCookie(this.fileHash);
-                    if (savedPosition) {
-                        this.currentChapterIndex = Math.min(savedPosition.chapterIndex, this.chapters.length - 1);
-                    } else {
-                        this.currentChapterIndex = 0;
-                    }
+                    // Restore reading position
+                    this.currentChapterIndex = Math.max(0, Math.min(savedChapterIndex || 0, this.chapters.length - 1));
 
                     return true;
                 } catch (error) {
@@ -537,7 +627,7 @@
                     }
 
                     this.currentChapterIndex = index;
-                    this.setCookie(this.fileHash, this.currentChapterIndex);
+                    this.saveProgress().catch(e => console.warn('Could not save progress:', e));
 
                     return {
                         title: chapter.label,
@@ -585,8 +675,7 @@
                     </div>
                 `;
 
-                uploadSection.style.display = 'none';
-                readerSection.classList.add('active');
+                showView('reader');
 
                 await displayChapter();
             } catch (error) {
@@ -651,14 +740,104 @@
         });
 
         backBtn.addEventListener('click', () => {
-            uploadSection.style.display = 'block';
-            readerSection.classList.remove('active');
+            showView('upload');
             epubFileInput.value = '';
             uploadStatus.innerHTML = '';
             bookInfo.innerHTML = '';
             reader.epub = null;
             reader.chapters = [];
         });
+
+        // Views: 'upload', 'reader' or 'library'
+        const librarySection = document.getElementById('librarySection');
+        const libraryList = document.getElementById('libraryList');
+
+        function showView(name) {
+            uploadSection.style.display = name === 'upload' ? 'block' : 'none';
+            readerSection.classList.toggle('active', name === 'reader');
+            librarySection.style.display = name === 'library' ? 'block' : 'none';
+        }
+
+        function route() {
+            if (location.hash === '#library') {
+                showView('library');
+                renderLibrary();
+            } else {
+                showView(reader.chapters.length ? 'reader' : 'upload');
+            }
+        }
+
+        async function openStoredBook(id) {
+            await reader.openStored(id);
+            location.hash = '';
+            showView('reader');
+            await displayChapter();
+        }
+
+        async function renderLibrary() {
+            libraryList.innerHTML = '<div class="loading">Loading...</div>';
+            let books;
+            try {
+                books = await reader.listBooks();
+            } catch (error) {
+                libraryList.innerHTML = `<div class="error">Could not read library: ${escapeHtml(error.message)}</div>`;
+                return;
+            }
+            if (!books.length) {
+                libraryList.innerHTML = '<div class="loading">No stored books yet.</div>';
+                return;
+            }
+            libraryList.innerHTML = '';
+            for (const book of books) {
+                const item = document.createElement('div');
+                item.className = 'library-item';
+                item.innerHTML = `
+                    <div>
+                        <div class="library-item-title">${escapeHtml(book.title)}</div>
+                        <div class="library-item-meta">${escapeHtml(book.author)} · chapter ${book.chapterIndex + 1} · last opened ${escapeHtml(new Date(book.lastOpened).toLocaleString())}</div>
+                    </div>
+                    <div class="library-item-actions">
+                        <button class="btn btn--primary">Open</button>
+                        <button class="btn btn--secondary">Delete</button>
+                    </div>
+                `;
+                const [openBtn, deleteBtn] = item.querySelectorAll('button');
+                openBtn.addEventListener('click', async () => {
+                    try {
+                        await openStoredBook(book.id);
+                    } catch (error) {
+                        libraryList.insertAdjacentHTML('afterbegin', `<div class="error">Error opening book: ${escapeHtml(error.message)}</div>`);
+                    }
+                });
+                deleteBtn.addEventListener('click', async () => {
+                    await reader.deleteBook(book.id);
+                    if (reader.fileHash === book.id) {
+                        reader.chapters = [];
+                        reader.fileHash = null;
+                    }
+                    renderLibrary();
+                });
+                libraryList.appendChild(item);
+            }
+        }
+
+        window.addEventListener('hashchange', route);
+
+        // On page open, resume the last opened book
+        (async () => {
+            if (location.hash !== '#library') {
+                try {
+                    const [last] = await reader.listBooks();
+                    if (last) {
+                        await openStoredBook(last.id);
+                        return;
+                    }
+                } catch (error) {
+                    console.warn('Could not resume last book:', error);
+                }
+            }
+            route();
+        })();
 
         function escapeHtml(text) {
             const map = {
