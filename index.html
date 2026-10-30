@@ -339,6 +339,13 @@
             font-weight: var(--font-weight-semibold);
         }
 
+        .chapter-input {
+            display: inline-block;
+            width: 5em;
+            padding: var(--space-4) var(--space-8);
+            text-align: center;
+        }
+
         .library-section {
             display: none;
         }
@@ -417,7 +424,9 @@
             <a href="#library" class="library-link">📚 Library</a>
             <div class="navigation">
                 <button class="btn btn--secondary nav-button" id="prevBtn">← Previous</button>
-                <div class="nav-center" id="chapterNav">Chapter 1 of 1</div>
+                <div class="nav-center" id="chapterNav">
+                    Chapter <input type="number" id="chapterInput" class="form-control chapter-input" min="1" value="1"> of <span id="chapterTotal">1</span>
+                </div>
                 <button class="btn btn--secondary nav-button" id="nextBtn">Next →</button>
             </div>
 
@@ -506,7 +515,7 @@
                 } catch (e) {
                     console.warn('Could not read stored books:', e);
                 }
-                await this.parseEPUB(await file.arrayBuffer(), id, existing ? existing.chapterIndex : 0);
+                await this.parseEPUB(await file.arrayBuffer(), id, existing ? existing.chapterIndex : 0, file.name);
                 try {
                     await this.putBook({
                         id,
@@ -526,15 +535,16 @@
             async openStored(id) {
                 const book = await this.getBook(id);
                 if (!book) throw new Error('Book not found in storage');
-                await this.parseEPUB(await book.blob.arrayBuffer(), id, book.chapterIndex);
+                await this.parseEPUB(await book.blob.arrayBuffer(), id, book.chapterIndex, book.name || book.title);
                 book.lastOpened = Date.now();
                 await this.putBook(book);
             }
 
             // Parse EPUB data
-            async parseEPUB(arrayBuffer, id, savedChapterIndex) {
+            async parseEPUB(arrayBuffer, id, savedChapterIndex, name) {
                 try {
                     this.fileHash = id;
+                    this.name = name;
                     const zip = new JSZip();
                     await zip.loadAsync(arrayBuffer);
 
@@ -648,7 +658,19 @@
         const uploadStatus = document.getElementById('uploadStatus');
         const bookInfo = document.getElementById('bookInfo');
         const chapterContent = document.getElementById('chapterContent');
-        const chapterNav = document.getElementById('chapterNav');
+        const chapterInput = document.getElementById('chapterInput');
+        const chapterTotal = document.getElementById('chapterTotal');
+
+        // Jump to the entered chapter
+        chapterInput.addEventListener('change', async () => {
+            const n = parseInt(chapterInput.value, 10);
+            if (isNaN(n)) {
+                chapterInput.value = reader.currentChapterIndex + 1;
+                return;
+            }
+            reader.currentChapterIndex = Math.max(0, Math.min(n, reader.chapters.length) - 1);
+            await displayChapter();
+        });
         const loadingIndicator = document.getElementById('loadingIndicator');
         const prevBtn = document.getElementById('prevBtn');
         const nextBtn = document.getElementById('nextBtn');
@@ -669,6 +691,7 @@
                 uploadStatus.innerHTML = `<div class="success">✓ EPUB loaded successfully!</div>`;
                 bookInfo.innerHTML = `
                     <div class="book-info">
+                        <strong>File:</strong> ${escapeHtml(reader.name)}<br>
                         <strong>Title:</strong> ${escapeHtml(reader.title)}<br>
                         <strong>Author:</strong> ${escapeHtml(reader.author)}<br>
                         <strong>Chapters:</strong> ${reader.chapters.length}
@@ -703,7 +726,10 @@
         function updateNavigation() {
             const total = reader.chapters.length;
             const current = reader.currentChapterIndex + 1;
-            chapterNav.textContent = `Chapter ${current} of ${total}`;
+            chapterInput.value = current;
+            chapterInput.max = total;
+            chapterTotal.textContent = total;
+            document.title = reader.name || 'EPUB Reader';
 
             prevBtn.disabled = reader.currentChapterIndex === 0;
             nextBtn.disabled = reader.currentChapterIndex === total - 1;
@@ -793,8 +819,8 @@
                 item.className = 'library-item';
                 item.innerHTML = `
                     <div>
-                        <div class="library-item-title">${escapeHtml(book.title)}</div>
-                        <div class="library-item-meta">${escapeHtml(book.author)} · chapter ${book.chapterIndex + 1} · last opened ${escapeHtml(new Date(book.lastOpened).toLocaleString())}</div>
+                        <div class="library-item-title">${escapeHtml(book.name || book.title)}</div>
+                        <div class="library-item-meta">chapter ${book.chapterIndex + 1} · last opened ${escapeHtml(new Date(book.lastOpened).toLocaleString())}</div>
                     </div>
                     <div class="library-item-actions">
                         <button class="btn btn--primary">Open</button>
